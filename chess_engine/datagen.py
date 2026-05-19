@@ -212,18 +212,14 @@ class PositionGenerator:
     
     def generate(self) -> Board:
         """Generate a random chess position using one of several methods."""
-        method = self.rng.randint(0, 4)
+        method = self.rng.randint(0, 2)
         
         if method == 0:
             return self._random_game()
         elif method == 1:
             return self._from_opening()
-        elif method == 2:
-            return self._random_fen()
-        elif method == 3:
-            return self._endgame_position()
         else:
-            return self._midgame_position()
+            return self._endgame_position()
     
     def _random_game(self) -> Board:
         """Play random legal moves from startpos."""
@@ -239,7 +235,7 @@ class PositionGenerator:
                 move = self.rng.choice(captures)
             else:
                 move = self.rng.choice(moves)
-            board.push(move)
+            board.make_move(move)
         return board
     
     def _from_opening(self) -> Board:
@@ -259,7 +255,7 @@ class PositionGenerator:
             moves = list(board.generate_moves())
             if not moves:
                 break
-            board.push(self.rng.choice(moves))
+            board.make_move(self.rng.choice(moves))
         return board
     
     def _random_fen(self) -> Board:
@@ -286,7 +282,7 @@ class PositionGenerator:
             moves = list(board.generate_moves())
             if not moves:
                 break
-            board.push(self.rng.choice(moves))
+            board.make_move(self.rng.choice(moves))
         return board
     
     def _midgame_position(self) -> Board:
@@ -297,7 +293,7 @@ class PositionGenerator:
             moves = list(board.generate_moves())
             if not moves:
                 break
-            board.push(self.rng.choice(moves))
+            board.make_move(self.rng.choice(moves))
         return board
 
 
