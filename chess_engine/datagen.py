@@ -491,9 +491,8 @@ class DataGenerator:
                   f'({total/elapsed:.0f} pos/s)', flush=True)
     
     def _write_shard(self, idx, tensors, values, wdls, policies):
-        """Write a data shard to disk atomically (temp file → rename)."""
+        """Write a data shard to disk."""
         shard_path = self.output_dir / f'shard_{idx:05d}.npz'
-        tmp_path = self.output_dir / f'shard_{idx:05d}.tmp'
         
         # Validate and filter: only keep correctly-shaped tensors
         valid_tensors = []
@@ -520,9 +519,11 @@ class DataGenerator:
             if valid_pol:
                 save_dict['policies'] = np.concatenate(valid_pol)
         
-        # Write to temp file first, then rename atomically
-        np.savez_compressed(tmp_path, **save_dict)
-        tmp_path.rename(shard_path)
+        # Write directly (auto-trainer handles corrupt files)
+        np.savez_compressed(shard_path, **save_dict)
+        
+        n = len(save_dict['tensors'])
+        print(f'\n  Saved shard {idx}: {n:,} positions to {shard_path}', flush=True)
         
         n = len(save_dict['tensors'])
         print(f'\n  Saved shard {idx}: {n:,} positions to {shard_path}', flush=True)
