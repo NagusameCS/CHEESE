@@ -1,0 +1,23 @@
+{
+  "loss": [
+    4.1671600341796875
+  ],
+  "value_loss": [
+    8.390149560000282e-06
+  ],
+  "policy_loss": [
+    8.317790031433105
+  ],
+  "k_values": [
+    4
+  ],
+  "game_stats": [
+    {
+      "games": 2,
+      "white_wins": 0,
+      "black_wins": 0,
+      "draws": 2,
+      "total_moves": 600
+    }
+  ]
+}

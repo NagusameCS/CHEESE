@@ -1,0 +1,17 @@
+# HyperTensor Chess Engine Requirements
+# =====================================
+# Core dependencies for the chess engine
+
+# Neural network framework
+torch>=2.0.0
+numpy>=1.24.0
+
+# HyperTensor geometric framework (optional, fallbacks included)
+# Install from local clone:
+#   pip install -e ../HyperTensor
+# Or from PyPI:
+#   hypertensor-framework>=1.1.0
+#   hypertensor-core>=1.0.0
+
+# For UCI GUI integration (optional)
+# python-chess>=1.10.0  # For validation/testing only
