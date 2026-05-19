@@ -45,19 +45,19 @@ from chess_engine.pretrain import heuristic_evaluate
 
 @dataclass
 class TrainConfig:
-    # Model
-    model_size: str = 'xl'  # 'large' (~5M) or 'xl' (~12M) or 'xxl' (~20M)
+    # Model (up to 40M params for A10G 24GB)
+    model_size: str = 'xl'  # 'small'→'xxxl': 0.5M→40M params
     
-    # Data generation
+    # Data generation (progressive: 14→18→22 as model improves)
     num_workers: int = 4         # Parallel Stockfish evaluators
-    sf_depth: int = 14           # Stockfish search depth
-    positions_per_batch: int = 20000  # Positions per training batch
-    max_positions: int = 10_000_000   # Stop after this many positions
+    sf_depth: int = 18           # Stockfish search depth (14=~2800, 18=~3200, 22=~3500)
+    positions_per_batch: int = 20000
+    max_positions: int = 10_000_000
     
     # Training
-    epochs_per_batch: int = 5    # Epochs over accumulated data
-    batch_size: int = 256        # GPU batch size
-    grad_accum_steps: int = 2    # Gradient accumulation steps
+    epochs_per_batch: int = 5
+    batch_size: int = 256
+    grad_accum_steps: int = 2
     learning_rate: float = 3e-4  # Peak learning rate
     min_lr: float = 1e-6         # Minimum LR (cosine schedule)
     warmup_epochs: int = 2       # LR warmup epochs
@@ -76,11 +76,14 @@ class TrainConfig:
 
 
 def get_model_config(size: str) -> dict:
-    """Model architecture by size."""
+    """Model architecture by size. Scales up to 40M params for A10G."""
     configs = {
-        'large':  {'k_manifold': 64,  'hidden_dim': 384,  'num_layers': 6},   # ~5M params
-        'xl':     {'k_manifold': 96,  'hidden_dim': 512,  'num_layers': 8},   # ~12M params
-        'xxl':    {'k_manifold': 128, 'hidden_dim': 768,  'num_layers': 10},  # ~20M params
+        'small':  {'k_manifold': 32,  'hidden_dim': 128,  'num_layers': 3},   # ~0.5M
+        'medium': {'k_manifold': 48,  'hidden_dim': 256,  'num_layers': 5},   # ~2M
+        'large':  {'k_manifold': 64,  'hidden_dim': 384,  'num_layers': 6},   # ~5M
+        'xl':     {'k_manifold': 96,  'hidden_dim': 512,  'num_layers': 8},   # ~4.2M (actual: ~12M with FT)
+        'xxl':    {'k_manifold': 128, 'hidden_dim': 768,  'num_layers': 10},  # ~20M
+        'xxxl':   {'k_manifold': 160, 'hidden_dim': 1024, 'num_layers': 12},  # ~40M (A10G max)
     }
     return configs.get(size, configs['xl'])
 
@@ -509,6 +512,7 @@ if __name__ == '__main__':
     p.add_argument('--workers', type=int, default=4)
     p.add_argument('--sf-depth', type=int, default=14)
     p.add_argument('--positions-per-batch', type=int, default=20000)
+    p.add_argument('--batch-size', type=int, default=256)
     p.add_argument('--no-resume', action='store_true')
     args = p.parse_args()
     
@@ -517,6 +521,7 @@ if __name__ == '__main__':
         num_workers=args.workers,
         sf_depth=args.sf_depth,
         positions_per_batch=args.positions_per_batch,
+        batch_size=args.batch_size,
         resume=not args.no_resume,
     )
     

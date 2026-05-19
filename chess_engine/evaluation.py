@@ -31,7 +31,16 @@ if _HYPERTENSOR_PATH.exists():
     sys.path.insert(0, str(_HYPERTENSOR_PATH / "scripts"))
     sys.path.insert(0, str(_HYPERTENSOR_PATH / "hypercore"))
 
-from hypercore.geodesic_metric import GeodesicMetric, GenerationMetrics
+try:
+    from hypercore.geodesic_metric import GeodesicMetric, GenerationMetrics
+    _GEODESIC_AVAILABLE = True
+except ImportError:
+    _GEODESIC_AVAILABLE = False
+    class GeodesicMetric:
+        def __init__(self, dim=64):
+            self.dim = dim
+            self._coverage_radius = 1.0
+    GenerationMetrics = None
 
 _AXIOM_GAUGE_AVAILABLE = False
 _ONLINE_OJA_AVAILABLE = False
