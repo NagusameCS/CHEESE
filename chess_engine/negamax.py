@@ -38,6 +38,14 @@ from .evaluation import HyperTensorChessNet, CUDA_AVAILABLE, DEVICE
 from .pretrain import heuristic_evaluate
 from .opening_book import get_opening_move
 
+# Lazy import for jury gate (avoids circular deps)
+_JURY_GATE_AVAILABLE = False
+try:
+    from .jury_gate import ChessJuryGate, integrate_jury_gate
+    _JURY_GATE_AVAILABLE = True
+except ImportError:
+    pass
+
 
 # ===========================================================================
 # Constants
@@ -211,6 +219,12 @@ class NegamaxEngine:
         self.use_fortress = True        # Fortress/blockade detection (~15-20 Elo)
         self.use_pondering = True       # Think on opponent's time (~30 Elo)
         self.use_adaptive_time = True   # Smart time allocation (~15-25 Elo)
+        self.use_jury_gate = _JURY_GATE_AVAILABLE  # Geometric jury move validation (~20-30 Elo)
+        
+        # Jury gate (geometric move validation from HyperTensor OTT)
+        self.jury_gate = None
+        if self.use_jury_gate and _JURY_GATE_AVAILABLE:
+            self.jury_gate = ChessJuryGate(k=32, jury_threshold=0.75)
         
         # Pondering state
         self.ponder_move: Optional[Move] = None
@@ -865,6 +879,15 @@ class NegamaxEngine:
             if singular_move is not None and move == singular_move:
                 extension += 1  # Singular extension (~30-50 Elo)
             
+            # JURY GATE EXTENSION: extend search for moves leading to unusual positions
+            if self.use_jury_gate and self.jury_gate is not None and depth >= 4:
+                try:
+                    should_extend, jury_extra = self.jury_gate.should_extend_search(board, move)
+                    if should_extend and jury_extra > 0:
+                        extension += jury_extra  # Geometric extension (~20-30 Elo)
+                except:
+                    pass
+            
             # Effective depth for the child search
             child_depth = depth - 1 + extension
             
@@ -989,6 +1012,17 @@ class NegamaxEngine:
             effective_time = min(effective_time, self.max_time_ms)
             
             time_limit_ms = effective_time
+        
+        # JURY GATE: increase time for unusual/volatile positions
+        if self.use_jury_gate and self.jury_gate is not None and self.jury_gate.basis is not None:
+            try:
+                jury_accept, jury_J, _ = self.jury_gate.validate_move(board, 
+                    board.generate_legal_moves()[0] if board.generate_legal_moves() else None)
+                if jury_J < 0.6:  # Uncharted territory
+                    time_limit_ms = min(time_limit_ms * 1.5, 
+                                       time_remaining_ms * 0.5 if time_remaining_ms else time_limit_ms * 3)
+            except:
+                pass
         
         # Clear per-search stats
         self.state.clear_search_stats()
