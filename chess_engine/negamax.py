@@ -94,6 +94,7 @@ class SearchState:
     futility_cuts: int = 0
     lmr_reductions: int = 0
     syzygy_hits: int = 0
+    search_extensions: int = 0  # Sacrifice/check extensions
     
     def clear_search_stats(self):
         self.nodes_searched = 0
@@ -102,6 +103,7 @@ class SearchState:
         self.futility_cuts = 0
         self.lmr_reductions = 0
         self.syzygy_hits = 0
+        self.search_extensions = 0
 
 
 @dataclass
@@ -167,6 +169,108 @@ class NegamaxEngine:
         for entry in self.state.tt.values():
             entry.age += 1
     
+    # =====================================================================
+    # Positional Sacrifice Detection
+    # =====================================================================
+    
+    @staticmethod
+    def king_exposure(board: Board, color: int) -> int:
+        """Estimate how exposed a king is. Higher = more exposed/vulnerable.
+        Looks at pawn shield, open files near king, enemy piece proximity."""
+        king_sq = board.king_sq[color]
+        kr, kf = king_sq // 8, king_sq % 8
+        exposure = 0
+        
+        # Pawn shield: check 3 squares in front of king
+        direction = -1 if color == Color.WHITE else 1
+        for df in [-1, 0, 1]:
+            for dr in [1, 2]:
+                r = kr + dr * direction
+                f = kf + df
+                if 0 <= r < 8 and 0 <= f < 8:
+                    p = board.piece_at(r * 8 + f)
+                    if p and p[0] == color and p[1] == Piece.PAWN:
+                        exposure -= 15 if dr == 1 else 8
+                    else:
+                        exposure += 10  # Missing pawn shield
+        
+        # Open files near king
+        for df in [-1, 0, 1]:
+            f = kf + df
+            if 0 <= f < 8:
+                has_own_pawn = False
+                for r in range(8):
+                    p = board.piece_at(r * 8 + f)
+                    if p and p[0] == color and p[1] == Piece.PAWN:
+                        has_own_pawn = True
+                        break
+                if not has_own_pawn:
+                    exposure += 20  # Open file near king
+        
+        # Enemy piece proximity to king
+        enemy = Color.BLACK if color == Color.WHITE else Color.WHITE
+        for sq, (c, piece) in board.pieces.items():
+            if c == enemy and piece in (Piece.QUEEN, Piece.ROOK, Piece.BISHOP, Piece.KNIGHT):
+                dist = abs(sq // 8 - kr) + abs(sq % 8 - kf)
+                if dist <= 3:
+                    exposure += max(0, (4 - dist)) * 12
+        
+        return exposure
+    
+    def is_sacrifice(self, board: Board, move: Move) -> Tuple[bool, float]:
+        """Check if a move is a positional sacrifice.
+        Returns (is_sacrifice, king_exposure_delta).
+        A sacrifice gives up material but dramatically improves king safety
+        or exposes the enemy king."""
+        victim = board.piece_at(move.to_sq)
+        attacker = board.piece_at(move.from_sq)
+        if not attacker:
+            return False, 0.0
+        
+        # Material balance change
+        material_delta = 0
+        if victim:
+            material_delta = PIECE_VALUES[victim[1]]
+        
+        # Is this losing material?
+        losing_material = False
+        if victim and PIECE_VALUES[attacker[1]] > PIECE_VALUES[victim[1]]:
+            losing_material = True
+        elif not victim and move.promotion:
+            # Pawn promotion is a gain, not sacrifice
+            pass
+        elif not victim:
+            # Quiet move — not a material sacrifice
+            pass
+        
+        if not losing_material:
+            return False, 0.0
+        
+        # Check if this move exposes the enemy king
+        us = board.color_to_move
+        enemy = Color.BLACK if us == Color.WHITE else Color.WHITE
+        
+        # Make move temporarily to check king exposure change
+        board_copy = board.copy()
+        board_copy.make_move(move)
+        
+        enemy_exposure_before = self.king_exposure(board, enemy)
+        enemy_exposure_after = self.king_exposure(board_copy, enemy)
+        our_exposure_before = self.king_exposure(board, us)
+        our_exposure_after = self.king_exposure(board_copy, us)
+        
+        # Delta: positive = enemy king MORE exposed (good for us)
+        enemy_delta = enemy_exposure_after - enemy_exposure_before
+        our_delta = our_exposure_after - our_exposure_before
+        
+        # A sacrifice makes sense if it exposes enemy king or shields ours
+        compensation = enemy_delta - our_delta
+        
+        if compensation > 15 and material_delta > 50:
+            return True, compensation / 100.0
+        
+        return False, 0.0
+
     # =====================================================================
     # Evaluation (GPU-batched for speed)
     # =====================================================================
@@ -248,6 +352,17 @@ class NegamaxEngine:
             # Castling
             if move.is_castle_kingside or move.is_castle_queenside:
                 score += 500
+            
+            # SACRIFICE BONUS: moves that give up material but attack enemy king
+            # These deserve a closer look — don't prune them
+            victim = board.piece_at(move.to_sq)
+            attacker = board.piece_at(move.from_sq)
+            if victim and attacker:
+                if PIECE_VALUES[attacker[1]] > PIECE_VALUES[victim[1]]:
+                    # We're losing material — check if this attacks the king
+                    is_sac, sac_bonus = self.is_sacrifice(board, move)
+                    if is_sac:
+                        score += int(sac_bonus * 500000)  # Big boost to not prune
             
             scored.append((move, score))
         
@@ -422,15 +537,35 @@ class NegamaxEngine:
             move_count += 1
             
             # Futility pruning for quiet moves at frontier
+            # Exception: don't prune sacrifices or king attacks
             if self.use_futility and depth <= 3 and not in_check and not move.promotion:
                 victim = board.piece_at(move.to_sq)
                 if not victim:
-                    static_eval = self.evaluate(board)
-                    if is_futile(static_eval, beta, depth):
-                        self.state.futility_cuts += 1
-                        continue
+                    # Check if this is a sacrifice/king attack
+                    is_sac, _ = self.is_sacrifice(board, move)
+                    if not is_sac:
+                        static_eval = self.evaluate(board)
+                        if is_futile(static_eval, beta, depth):
+                            self.state.futility_cuts += 1
+                            continue
             
             board.make_move(move)
+            
+            # Search extension for sacrifices and checks
+            extension = 0
+            if not in_check:
+                # Extend if this move puts enemy in check
+                if board.is_in_check():
+                    extension = 1  # Check extension
+                else:
+                    # Extend for positional sacrifices that expose enemy king
+                    is_sac, sac_bonus = self.is_sacrifice(board, move)
+                    if is_sac and depth >= 3:
+                        extension = 1  # Sacrifice extension
+                        self.state.search_extensions += 1
+            
+            # Effective depth for the child search
+            child_depth = depth - 1 + extension
             
             # Late Move Reduction
             if self.use_lmr and move_count >= 4 and depth >= 3:
@@ -438,32 +573,31 @@ class NegamaxEngine:
                 is_quiet = (victim is None and not move.promotion)
                 reduction = get_lmr_reduction(depth, move_count, is_quiet)
                 
+                # Don't reduce sacrifices or moves that give check
+                if extension > 0:
+                    reduction = max(0, reduction - 1)  # Halve the reduction
+                
                 if reduction > 0:
                     self.state.lmr_reductions += 1
-                    # Reduced depth search (zero window)
-                    val = -self.search(board, depth - 1 - reduction, -alpha - 1, -alpha,
+                    val = -self.search(board, child_depth - reduction, -alpha - 1, -alpha,
                                       ply + 1, move, allow_null=True)
                     
-                    # If reduced search beats alpha, research at full depth
                     if val > alpha:
-                        val = -self.search(board, depth - 1, -beta, -alpha,
+                        val = -self.search(board, child_depth, -beta, -alpha,
                                           ply + 1, move, allow_null=True)
                 else:
-                    val = -self.search(board, depth - 1, -beta, -alpha,
+                    val = -self.search(board, child_depth, -beta, -alpha,
                                       ply + 1, move, allow_null=True)
             else:
                 # Full depth search
                 if move_count == 1:
-                    # First move: full window
-                    val = -self.search(board, depth - 1, -beta, -alpha,
+                    val = -self.search(board, child_depth, -beta, -alpha,
                                       ply + 1, move, allow_null=True)
                 else:
-                    # Later moves: zero window (PVS)
-                    val = -self.search(board, depth - 1, -alpha - 1, -alpha,
+                    val = -self.search(board, child_depth, -alpha - 1, -alpha,
                                       ply + 1, move, allow_null=True)
                     if val > alpha and val < beta:
-                        # Research with full window
-                        val = -self.search(board, depth - 1, -beta, -alpha,
+                        val = -self.search(board, child_depth, -beta, -alpha,
                                           ply + 1, move, allow_null=True)
             
             board.unmake_move()
@@ -573,6 +707,7 @@ class NegamaxEngine:
                 'futility_cuts': self.state.futility_cuts,
                 'lmr_reductions': self.state.lmr_reductions,
                 'syzygy_hits': self.state.syzygy_hits,
+                'extensions': self.state.search_extensions,
             }
         
         return best_move, stats

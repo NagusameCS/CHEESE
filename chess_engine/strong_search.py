@@ -441,25 +441,6 @@ class SyzygyProbe:
             except Exception:
                 pass
         return None
-        except Exception:
-            return None
-    
-    def probe_dtz(self, board: Board) -> Optional[int]:
-        """Probe DTZ (distance to zero)."""
-        self._init_tb()
-        if not self.available or not self.tb: return None
-        
-        try:
-            import chess
-            pyb = chess.Board(board.fen())
-            piece_count = len(board.pieces)
-            if piece_count > 6:
-                return None
-            
-            dtz = self.tb.probe_dtz(pyb)
-            return dtz
-        except Exception:
-            return None
 
 
 # ===========================================================================
