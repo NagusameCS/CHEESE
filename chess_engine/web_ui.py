@@ -24,7 +24,7 @@ from flask import Flask, jsonify, request, send_from_directory
 
 from .board import Board, Move, Color, Piece, STARTING_FEN, SQUARE_NAMES
 from .evaluation import create_model, CUDA_AVAILABLE, DEVICE
-from .search import HyperTensorSearch
+from .negamax import NegamaxEngine
 from .opening_book import get_opening_move
 from .pretrain import heuristic_evaluate
 
@@ -74,10 +74,10 @@ def init_engine():
             print(f'[WebUI] Loaded {loaded}/{total} params from best model (val_loss={_cached_val_loss})', flush=True)
         model.eval()
         engine_state['model'] = model
-        engine_state['search'] = HyperTensorSearch(
-            model, num_simulations=200, use_opening_book=True, tt_size_mb=16
+        engine_state['search'] = NegamaxEngine(
+            model, tt_size_mb=64
         )
-        print('[WebUI] Engine ready', flush=True)
+        print('[WebUI] Negamax engine ready', flush=True)
 
 # Preload at startup
 _cached_val_loss = None
@@ -86,10 +86,10 @@ import torch
 init_engine()
 
 def engine_think():
-    """Background search."""
+    """Background search using negamax PVS."""
     try:
         init_engine()
-        move, stats = engine_state['search'].search(
+        move, stats = engine_state['search'].find_best_move(
             engine_state['board'], time_limit_ms=3000
         )
         return move, stats

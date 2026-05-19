@@ -12,7 +12,7 @@ from typing import Optional
 
 from .board import Board, Move, STARTING_FEN
 from .evaluation import HyperTensorChessNet, create_model
-from .search import HyperTensorSearch, IterativeDeepeningSearch
+from .negamax import NegamaxEngine
 
 
 class UCIEngine:
@@ -50,10 +50,9 @@ class UCIEngine:
             print("info string Model loaded (random weights — needs training)")
         
         if self.search is None:
-            self.search = HyperTensorSearch(
+            self.search = NegamaxEngine(
                 self.model,
-                use_jury_gate=self.use_jury,
-                use_gtc_cache=self.use_gtc,
+                tt_size_mb=128,
             )
     
     def uci_loop(self):
@@ -287,14 +286,13 @@ class UCIEngine:
         # Run search
         if self.search:
             if self.ponder:
-                # Run in ponder mode (background thread)
                 def ponder_search():
-                    self.search.search(self.board, time_limit_ms=self.time_limit_ms * 10)
+                    self.search.find_best_move(self.board, time_limit_ms=self.time_limit_ms * 10)
                 self.ponder_thread = threading.Thread(target=ponder_search, daemon=True)
                 self.ponder_thread.start()
                 return
             
-            best_move, stats = self.search.search(
+            best_move, stats = self.search.find_best_move(
                 self.board, time_limit_ms=self.time_limit_ms
             )
             
@@ -303,17 +301,17 @@ class UCIEngine:
                 
                 # Print search info
                 if stats:
-                    sims = stats.get('simulations', 0)
+                    nodes = stats.get('nodes', 0)
                     depth = stats.get('depth', 0)
-                    value = stats.get('best_value', 0)
-                    jury_acc = stats.get('jury_accepts', 0)
-                    cache_hits = stats.get('cache_hits', 0)
+                    score = stats.get('score', 0)
+                    nps = stats.get('nps', 0)
                     time_ms = stats.get('time_ms', 0)
-                    nps = int(sims / (time_ms / 1000)) if time_ms > 0 else 0
+                    tt = stats.get('tt_hits', 0)
+                    nulls = stats.get('null_cuts', 0)
                     
-                    print(f"info depth {depth} score cp {int(value * 100)} "
-                          f"nodes {sims} nps {nps} time {int(time_ms)} "
-                          f"jury_accepts {jury_acc} cache_hits {cache_hits}")
+                    print(f"info depth {depth} score cp {score} "
+                          f"nodes {nodes} nps {nps} time {time_ms} "
+                          f"tbhits {stats.get('syzygy_hits', 0)}")
             else:
                 # No move found (shouldn't happen)
                 legal = self.board.generate_legal_moves()

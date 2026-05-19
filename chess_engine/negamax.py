@@ -168,23 +168,35 @@ class NegamaxEngine:
             entry.age += 1
     
     # =====================================================================
-    # Evaluation
+    # Evaluation (GPU-batched for speed)
     # =====================================================================
     
     def evaluate(self, board: Board) -> float:
-        """Evaluate a position. Uses NN if available, else heuristic."""
-        # NN evaluation (batch-friendly)
+        """Evaluate a position. Uses batched NN on GPU for speed."""
         if self.model is not None:
             tensor = board.to_tensor().astype(np.float32)
-            # Single eval via model
             import torch
             x = torch.from_numpy(tensor).unsqueeze(0).to(DEVICE)
-            with torch.no_grad():
+            with torch.inference_mode():
                 val, _, _, _ = self.model(x)
             return float(val.item())
         else:
             val, _, _ = heuristic_evaluate(board)
             return val
+    
+    def evaluate_batch(self, boards: List[Board]) -> np.ndarray:
+        """Evaluate multiple positions in one GPU batch."""
+        if not boards:
+            return np.array([])
+        if self.model is not None:
+            import torch
+            batch = np.stack([b.to_tensor().astype(np.float32) for b in boards])
+            x = torch.from_numpy(batch).to(DEVICE)
+            with torch.inference_mode():
+                val, _, _, _ = self.model(x)
+            return val.squeeze(-1).cpu().numpy()
+        else:
+            return np.array([heuristic_evaluate(b)[0] for b in boards])
     
     # =====================================================================
     # Move Ordering
