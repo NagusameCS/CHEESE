@@ -19,7 +19,7 @@ if HT.exists():
 def main():
     p = argparse.ArgumentParser(description="HyperTensor Chess Engine v3.0")
     p.add_argument('mode', nargs='?', default='uci',
-                   choices=['uci','demo','train','trainloop','pretrain','expert','tui','web','play','selfplay','benchmark'])
+                   choices=['uci','demo','train','trainloop','pretrain','expert','tui','web','play','selfplay','benchmark','negamax'])
     p.add_argument('--model', type=str, default=None)
     p.add_argument('--device', type=str, default='cuda')
     p.add_argument('--k-start', type=int, default=4)
@@ -31,7 +31,7 @@ def main():
     p.add_argument('--no-opening', action='store_true')
     args = p.parse_args()
     {'uci':uci,'demo':demo,'train':train,'trainloop':trainloop,'pretrain':pretrain_cmd,'expert':expert_cmd,'tui':tui_cmd,'web':web_cmd,'play':play,
-     'selfplay':selfplay,'benchmark':benchmark}[args.mode](args)
+     'selfplay':selfplay,'benchmark':benchmark,'negamax':negamax_cmd}[args.mode](args)
 
 def uci(args):
     from .uci import UCIEngine; from .evaluation import create_model
@@ -231,5 +231,45 @@ def web_cmd(args):
     print('  Open: http://127.0.0.1:8080')
     print('  ' + '-'*40 + '\n')
     app.run(host='127.0.0.1', port=8080, debug=False, threaded=True)
+
+def negamax_cmd(args):
+    """Test the alpha-beta negamax search engine."""
+    from .evaluation import create_model, CUDA_AVAILABLE
+    from .negamax import NegamaxEngine
+    from .board import Board
+    import torch, time
+    
+    print('='*60)
+    print('HyperTensor Negamax Engine (PVS + LMR + Null-move)')
+    print('='*60)
+    
+    model = create_model(k_manifold=32, hidden_dim=128, num_layers=3)
+    if args.model:
+        ck = torch.load(args.model, map_location='cpu')
+        model.load_state_dict(ck['model_state_dict'], strict=False)
+        print(f'Loaded model from {args.model}')
+    model.eval()
+    
+    engine = NegamaxEngine(model)
+    board = Board()
+    
+    print(f'Searching position: {board.fen()[:50]}...')
+    print('-'*40)
+    
+    t0 = time.time()
+    move, stats = engine.find_best_move(board, time_limit_ms=args.time)
+    elapsed = time.time() - t0
+    
+    print(f'Best move: {move.uci() if move else "none"}')
+    print(f'Score:     {stats.get("score", 0):+d} cp')
+    print(f'Depth:     {stats.get("depth", 0)}')
+    print(f'Nodes:     {stats.get("nodes", 0):,}')
+    print(f'NPS:       {stats.get("nps", 0):,}')
+    print(f'Time:      {elapsed*1000:.0f}ms')
+    print(f'TT hits:   {stats.get("tt_hits", 0):,}')
+    print(f'Null cuts: {stats.get("null_cuts", 0):,}')
+    print(f'Fut. cuts: {stats.get("futility_cuts", 0):,}')
+    print(f'LMR red.:  {stats.get("lmr_reductions", 0):,}')
+    print(f'Syzygy:    {stats.get("syzygy_hits", 0):,}')
 
 if __name__=='__main__': main()

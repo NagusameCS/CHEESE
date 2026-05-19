@@ -29,6 +29,8 @@ from .opening_book import OpeningBook, get_opening_move
 from .train_loop import train_loop, FastDataGenerator, PrioritizedBuffer
 from .pretrain import pretrain_model, heuristic_evaluate
 from .expert_iteration import expert_iteration, HeuristicMCTS, ExpertDataGenerator
+from .negamax import NegamaxEngine, SearchState, HistoryTable, KillerTable
+
 # Lazy imports for heavy modules (avoid loading models at import time)
 def _get_web_main():
     from .web_ui import main as web_main
