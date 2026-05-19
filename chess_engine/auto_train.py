@@ -141,11 +141,18 @@ class AutoTrainer:
         return [s for s in shards if s.name not in self.seen_shards]
     
     def load_shard(self, path: Path) -> tuple:
-        """Load a data shard."""
-        data = np.load(path)
-        X = torch.from_numpy(data['tensors']).float().to(self.device)
-        y = torch.from_numpy(data['values']).float().to(self.device).unsqueeze(1)
-        return X, y
+        """Load a data shard. Handles corrupted files gracefully."""
+        try:
+            data = np.load(path)
+            X = torch.from_numpy(data['tensors']).float().to(self.device)
+            y = torch.from_numpy(data['values']).float().to(self.device).unsqueeze(1)
+            return X, y
+        except Exception as e:
+            print(f"  Corrupted shard {path.name}: {e} — skipping")
+            # Rename bad shard so it's not retried
+            bad_path = path.with_suffix('.bad')
+            path.rename(bad_path)
+            return None, None
     
     def validate(self) -> float:
         self.model.eval()
@@ -245,6 +252,8 @@ class AutoTrainer:
                     t0 = time.time()
                     
                     X, y = self.load_shard(shard_path)
+                    if X is None:
+                        continue  # Skip corrupted shard
                     self.train_on_shard(X, y, self.config.epochs_per_shard)
                     
                     self.seen_shards.add(shard_path.name)

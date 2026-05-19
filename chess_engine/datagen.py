@@ -307,7 +307,7 @@ class DataGenConfig:
     sf_depth: int = 14
     sf_threads: int = 1
     sf_hash: int = 32
-    positions_per_shard: int = 100000
+    positions_per_shard: int = 10000  # Smaller shards = faster feedback
     output_dir: str = 'data'
     max_positions: int = 5_000_000
     wdl_enabled: bool = True
@@ -390,11 +390,20 @@ class DataGenerator:
                         positions_since_restart = 0
                 
                 if batch_tensors:
+                    try:
+                        wdls_arr = np.stack(batch_wdls) if batch_wdls else None
+                    except (ValueError, np.AxisError):
+                        wdls_arr = None
+                    try:
+                        pol_arr = np.array(batch_policies, dtype=np.int64) if batch_policies else None
+                    except (ValueError, np.AxisError):
+                        pol_arr = None
+                    
                     self.result_queue.put({
                         'tensors': np.stack(batch_tensors),
                         'values': np.array(batch_values, dtype=np.float32),
-                        'wdls': np.stack(batch_wdls) if batch_wdls else None,
-                        'policies': np.array(batch_policies, dtype=np.int64) if batch_policies else None,
+                        'wdls': wdls_arr,
+                        'policies': pol_arr,
                         'count': len(batch_tensors)
                     })
         
@@ -482,19 +491,38 @@ class DataGenerator:
                   f'({total/elapsed:.0f} pos/s)', flush=True)
     
     def _write_shard(self, idx, tensors, values, wdls, policies):
-        """Write a data shard to disk."""
+        """Write a data shard to disk atomically (temp file → rename)."""
         shard_path = self.output_dir / f'shard_{idx:05d}.npz'
+        tmp_path = self.output_dir / f'shard_{idx:05d}.tmp'
+        
+        # Validate and filter: only keep correctly-shaped tensors
+        valid_tensors = []
+        valid_values = []
+        for t, v in zip(tensors, values):
+            if isinstance(t, np.ndarray) and t.ndim >= 3:
+                valid_tensors.append(t)
+                valid_values.append(v)
+        
+        if not valid_tensors:
+            print(f'\n  Skipping shard {idx}: no valid tensors', flush=True)
+            return
         
         save_dict = {
-            'tensors': np.concatenate(tensors),
-            'values': np.concatenate(values),
+            'tensors': np.concatenate(valid_tensors),
+            'values': np.concatenate(valid_values),
         }
         if wdls:
-            save_dict['wdls'] = np.concatenate(wdls)
+            valid_wdls = [w for w in wdls if isinstance(w, np.ndarray) and w.ndim == 2]
+            if valid_wdls:
+                save_dict['wdls'] = np.concatenate(valid_wdls)
         if policies:
-            save_dict['policies'] = np.concatenate(policies)
+            valid_pol = [p for p in policies if isinstance(p, np.ndarray) and p.ndim == 1]
+            if valid_pol:
+                save_dict['policies'] = np.concatenate(valid_pol)
         
-        np.savez_compressed(shard_path, **save_dict)
+        # Write to temp file first, then rename atomically
+        np.savez_compressed(tmp_path, **save_dict)
+        tmp_path.rename(shard_path)
         
         n = len(save_dict['tensors'])
         print(f'\n  Saved shard {idx}: {n:,} positions to {shard_path}', flush=True)
