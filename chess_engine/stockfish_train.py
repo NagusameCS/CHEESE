@@ -73,103 +73,121 @@ class StockfishEvaluator:
             pass
         return lines
     
-    def evaluate(self, board: Board) -> Dict:
-        if self.process is None:
-            self._start('stockfish')
-        
-        # If still no process, fall back to heuristic
-        if self.process is None or self.process.stdout is None:
-            val, _, _ = heuristic_evaluate(board)
-            return {'score_cp': int(val*1000), 'best_move': None,
-                    'wdl': [0.33,0.34,0.33], 'value': val, 'depth': 0}
-        
+    def _eval_inner(self, board: Board) -> Dict:
+        """Core evaluation logic (called with timeout)."""
         fen = board.fen()
         try:
             self._send(f'position fen {fen}')
             self._send(f'go depth {self.depth}')
         except:
-            # Restart and retry once
-            try:
-                self.process.terminate()
-            except: pass
-            self._start('stockfish')
-            if self.process is None or self.process.stdout is None:
-                val, _, _ = heuristic_evaluate(board)
-                return {'score_cp': int(val*1000), 'best_move': None,
-                        'wdl': [0.33,0.34,0.33], 'value': val, 'depth': 0}
-            try:
-                self._send(f'position fen {fen}')
-                self._send(f'go depth {self.depth}')
-            except:
-                val, _, _ = heuristic_evaluate(board)
-                return {'score_cp': int(val*1000), 'best_move': None,
-                        'wdl': [0.33,0.34,0.33], 'value': val, 'depth': 0}
+            raise RuntimeError("SF send failed")
         
         score_cp = 0
         best_move = None
-        wdl_score = 0.0
         search_depth = 0
         
-        try:
-            for line in self.process.stdout:
-                line = line.strip()
-                
-                if line.startswith('bestmove'):
+        for line in self.process.stdout:
+            line = line.strip()
+            
+            if line.startswith('bestmove'):
+                parts = line.split()
+                if len(parts) > 1:
+                    best_move = parts[1]
+                break
+            
+            if 'score cp' in line:
+                try:
                     parts = line.split()
-                    if len(parts) > 1:
-                        best_move = parts[1]
-                    break
-                
-                if 'score cp' in line:
-                    try:
-                        parts = line.split()
-                        cp_idx = parts.index('cp')
-                        if cp_idx + 1 < len(parts):
-                            score_cp = int(parts[cp_idx + 1])
-                    except (ValueError, IndexError):
-                        pass
-                elif 'score mate' in line:
-                    try:
-                        parts = line.split()
-                        mate_idx = parts.index('mate')
-                        if mate_idx + 1 < len(parts):
-                            mate_in = int(parts[mate_idx + 1])
-                            score_cp = 20000 if mate_in > 0 else -20000
-                    except (ValueError, IndexError):
-                        pass
-                
-                if 'depth' in line:
-                    try:
-                        parts = line.split()
-                        d_idx = parts.index('depth')
-                        if d_idx + 1 < len(parts):
-                            search_depth = int(parts[d_idx + 1])
-                    except (ValueError, IndexError):
-                        pass
-        except (OSError, BrokenPipeError, AttributeError):
-            # Stockfish crashed mid-evaluation, return heuristic
-            val, _, _ = heuristic_evaluate(board)
-            return {'score_cp': int(val*1000), 'best_move': None,
-                    'wdl': [0.33,0.34,0.33], 'value': val, 'depth': 0}
+                    cp_idx = parts.index('cp')
+                    if cp_idx + 1 < len(parts):
+                        score_cp = int(parts[cp_idx + 1])
+                except (ValueError, IndexError):
+                    pass
+            elif 'score mate' in line:
+                try:
+                    parts = line.split()
+                    mate_idx = parts.index('mate')
+                    if mate_idx + 1 < len(parts):
+                        mate_in = int(parts[mate_idx + 1])
+                        score_cp = 20000 if mate_in > 0 else -20000
+                except (ValueError, IndexError):
+                    pass
+            
+            if 'depth' in line:
+                try:
+                    parts = line.split()
+                    d_idx = parts.index('depth')
+                    if d_idx + 1 < len(parts):
+                        search_depth = int(parts[d_idx + 1])
+                except (ValueError, IndexError):
+                    pass
         
-        # Stockfish WDL model: score cp → WDL probability
-        # Based on Stockfish's internal WDL model (approximate)
         cp = max(-4000, min(4000, score_cp))
-        wdl_w = 1.0 / (1.0 + np.exp(-cp / 200.0))  # Sigmoid model
+        wdl_w = 1.0 / (1.0 + np.exp(-cp / 200.0))
         wdl_d = np.exp(-abs(cp) / 400.0) * 0.5
         wdl_l = max(0, 1.0 - wdl_w - wdl_d)
         total = wdl_w + wdl_d + wdl_l
         if total > 0:
             wdl_w /= total; wdl_d /= total; wdl_l /= total
-        wdl_score = wdl_w  # Win probability for side-to-move
         
         return {
             'score_cp': score_cp,
-            'value': np.tanh(score_cp / 400.0),  # Normalize to [-1, 1]
+            'value': np.tanh(score_cp / 400.0),
             'best_move': best_move,
             'wdl': [wdl_w, wdl_d, wdl_l],
             'depth': search_depth,
         }
+    
+    def evaluate(self, board: Board) -> Dict:
+        """Evaluate with timeout — restart SF if it hangs."""
+        if self.process is None:
+            self._start('stockfish')
+        
+        if self.process is None or self.process.stdout is None:
+            val, _, _ = heuristic_evaluate(board)
+            return {'score_cp': int(val*1000), 'best_move': None,
+                    'wdl': [0.33,0.34,0.33], 'value': val, 'depth': 0}
+        
+        import threading
+        result = [None]
+        exception = [None]
+        
+        def _run():
+            try:
+                result[0] = self._eval_inner(board)
+            except Exception as e:
+                exception[0] = e
+        
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        t.join(timeout=5.0)  # 5s timeout per position
+        
+        if t.is_alive():
+            # Stockfish hung — kill it and restart
+            try:
+                self.process.kill()
+            except:
+                pass
+            self.process = None
+            print(f'  SF timeout, restarting...', flush=True)
+            self._start('stockfish')
+            val, _, _ = heuristic_evaluate(board)
+            return {'score_cp': int(val*1000), 'best_move': None,
+                    'wdl': [0.33,0.34,0.33], 'value': val, 'depth': 0}
+        
+        if exception[0] or result[0] is None:
+            # Communication error — restart SF
+            try:
+                self.process.kill()
+            except:
+                pass
+            self.process = None
+            self._start('stockfish')
+            val, _, _ = heuristic_evaluate(board)
+            return {'score_cp': int(val*1000), 'best_move': None,
+                    'wdl': [0.33,0.34,0.33], 'value': val, 'depth': 0}
+        
+        return result[0]
     
     def close(self):
         if self.process:
