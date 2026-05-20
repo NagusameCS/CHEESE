@@ -1,18 +1,19 @@
 """
-HyperTensor Chess — Fast Training Loop v2
+HyperTensor Chess — Fast Training Loop v3
 ==========================================
-Simple, robust training that actually works. Generates positions with
-Stockfish and trains immediately. No complex sharding, no workers, no
-race conditions. Just works.
+GPU-saturating trainer: accumulates positions, trains HARD each cycle.
+Generates fresh positions with Stockfish evaluation, adds to growing
+dataset, then trains for many epochs on ALL data.
 
 Strategy:
   1. Generate N random positions via self-play (fast)
-  2. Evaluate with Stockfish depth 10 (reasonable accuracy, fast)
-  3. Train on GPU immediately
-  4. Repeat
+  2. Evaluate with Stockfish depth 10
+  3. Add to accumulated dataset (up to 200K positions)
+  4. Train on GPU for MANY epochs (50+) — actually uses the GPU
+  5. Repeat
 
 Usage:
-  python chess_engine/train_fast.py --model-size xl --batch-size 512 --hours 24
+  python chess_engine/train_fast.py --model-size xl --batch-size 1024 --epochs 50 --hours 24
 """
 
 import torch, numpy as np, time, os, sys, math, random, argparse
@@ -26,11 +27,14 @@ import torch.nn.functional as F
 
 
 class FastTrainer:
-    def __init__(self, model_size='xl', batch_size=512, sf_depth=10,
-                 positions_per_cycle=5000, lr=3e-4, pretrained=None):
+    def __init__(self, model_size='xl', batch_size=1024, sf_depth=10,
+                 positions_per_cycle=10000, epochs_per_cycle=50,
+                 lr=3e-4, pretrained=None, max_dataset=200000):
         self.batch_size = batch_size
         self.sf_depth = sf_depth
         self.positions_per_cycle = positions_per_cycle
+        self.epochs_per_cycle = epochs_per_cycle
+        self.max_dataset = max_dataset
         
         # Model
         from chess_engine.industrial_train import get_model_config
@@ -52,7 +56,12 @@ class FastTrainer:
         self.optimizer = create_optimizer(self.model, lr=lr)
         self.scaler = torch.amp.GradScaler('cuda') if DEVICE.type == 'cuda' else None
         
-        # Validation positions
+        # Accumulated dataset
+        self.all_X = []  # list of np arrays
+        self.all_y = []
+        self.dataset_size = 0
+        
+        # Validation positions (fixed, evaluated once at SF depth 18)
         self.val_boards = [
             Board(),
             Board('rnbqkb1r/1p2pppp/p2p1n2/8/3NP3/2N5/PPP2PPP/R1BQKB1R w KQkq - 0 6'),
@@ -60,7 +69,6 @@ class FastTrainer:
             Board('8/8/8/4k3/8/8/4Q3/4K3 w - - 0 1'),
         ]
         
-        # Get SF targets
         print(f"Getting SF depth-18 validation targets...")
         sf = StockfishEvaluator(depth=18)
         self.val_targets = []
@@ -77,6 +85,7 @@ class FastTrainer:
         self.cycle = 0
         self.best_val_loss = float('inf')
         self.total_positions = 0
+        self.train_time_total = 0.0
         
         Path('models').mkdir(exist_ok=True)
     
@@ -85,7 +94,6 @@ class FastTrainer:
         boards = []
         for _ in range(n):
             board = Board()
-            # Play 4-40 random moves to reach diverse positions
             for _ in range(random.randint(4, 40)):
                 moves = list(board.generate_legal_moves())
                 if not moves:
@@ -108,16 +116,21 @@ class FastTrainer:
         sf.close()
         return np.stack(tensors), np.array(values, dtype=np.float32)
     
-    def train_on_batch(self, X_np, y_np, epochs=3):
-        """Train on a batch of positions."""
-        n = len(X_np)
-        X = torch.from_numpy(X_np).float().to(DEVICE)
-        y = torch.from_numpy(y_np).float().to(DEVICE).unsqueeze(1)
+    def train_on_dataset(self):
+        """Train for many epochs on the entire accumulated dataset."""
+        if self.dataset_size == 0:
+            return
+        
+        X = torch.from_numpy(np.concatenate(self.all_X, axis=0)).float().to(DEVICE)
+        y = torch.from_numpy(np.concatenate(self.all_y, axis=0)).float().to(DEVICE).unsqueeze(1)
+        n = len(X)
+        
+        # Always train hard — GPU is idle otherwise
+        epochs = self.epochs_per_cycle
         
         for epoch in range(epochs):
             self.model.train()
             perm = torch.randperm(n, device=DEVICE)
-            losses = []
             self.optimizer.zero_grad()
             
             for start in range(0, n, self.batch_size):
@@ -134,18 +147,19 @@ class FastTrainer:
                     loss = F.mse_loss(vp, yb)
                     loss.backward()
                 
-                self.scaler.unscale_(self.optimizer) if self.scaler else None
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 2.0)
-                self.scaler.step(self.optimizer) if self.scaler else self.optimizer.step()
-                self.scaler.update() if self.scaler else None
+                if self.scaler:
+                    self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5.0)
+                if self.scaler:
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    self.optimizer.step()
                 self.optimizer.zero_grad()
-                losses.append(loss.item())
         
         del X, y
         if DEVICE.type == 'cuda':
             torch.cuda.empty_cache()
-        
-        return np.mean(losses)
     
     def validate(self):
         """Validate on fixed set."""
@@ -163,23 +177,33 @@ class FastTrainer:
         self.cycle += 1
         t0 = time.time()
         
-        # Generate
+        # Generate + Evaluate with SF (CPU-bound)
         boards = self.generate_positions(self.positions_per_cycle)
-        
-        # Evaluate with SF
         X_np, y_np = self.evaluate_with_sf(boards)
-        self.total_positions += len(X_np)
+        n_new = len(X_np)
         gen_time = time.time() - t0
+        self.total_positions += n_new
         
-        # Train
+        # Add to accumulated dataset
+        self.all_X.append(X_np)
+        self.all_y.append(y_np)
+        self.dataset_size += n_new
+        
+        # Trim old data if exceeding max
+        while self.dataset_size > self.max_dataset and len(self.all_X) > 1:
+            old_n = len(self.all_X[0])
+            self.all_X.pop(0)
+            self.all_y.pop(0)
+            self.dataset_size -= old_n
+        
+        # Train HARD on GPU
         train_t0 = time.time()
-        train_loss = self.train_on_batch(X_np, y_np)
+        self.train_on_dataset()
         train_time = time.time() - train_t0
+        self.train_time_total += train_time
         
         # Validate
         val_loss, avg_err = self.validate()
-        
-        # Elo estimate
         eval_elo = max(1500, int(3000 - 1500 * math.sqrt(max(val_loss, 0.0001))))
         
         # Save if best
@@ -189,16 +213,19 @@ class FastTrainer:
                 'model_state_dict': self.model.state_dict(),
                 'val_loss': val_loss,
                 'cycle': self.cycle,
+                'total_positions': self.total_positions,
             }, 'models/train_fast_best.pt')
             new_best = ' *** NEW BEST ***'
         else:
             new_best = ''
         
         total_time = time.time() - t0
+        gpu_pct = (train_time / total_time * 100) if total_time > 0 else 0
         print(f"Cycle {self.cycle:3d} | "
-              f"gen {gen_time:4.0f}s | train {train_time:3.0f}s | "
+              f"gen {gen_time:4.0f}s | train {train_time:4.0f}s ({gpu_pct:.0f}% GPU) | "
               f"loss {val_loss:.4f} | cp err {avg_err:4.0f} | "
-              f"elo ~{eval_elo} | total {self.total_positions:>8,} pos"
+              f"elo ~{eval_elo} | dataset {self.dataset_size:>7,} | "
+              f"total {self.total_positions:>9,} pos"
               f"{new_best}")
         
         return val_loss
@@ -208,20 +235,25 @@ class FastTrainer:
         deadline = time.time() + hours * 3600
         print(f"\nRunning for {hours}h (until {time.strftime('%H:%M', time.localtime(deadline))})")
         print(f"SF depth: {self.sf_depth}, positions/cycle: {self.positions_per_cycle}")
+        print(f"Epochs/cycle: up to {self.epochs_per_cycle}, max dataset: {self.max_dataset:,}")
         print(f"Device: {DEVICE}\n")
         
         while time.time() < deadline:
             self.run_cycle()
+        
+        print(f"\nDone. Total cycles: {self.cycle}, best val_loss: {self.best_val_loss:.4f}")
 
 
 if __name__ == '__main__':
     p = argparse.ArgumentParser()
     p.add_argument('--model-size', default='xl')
-    p.add_argument('--batch-size', type=int, default=512)
+    p.add_argument('--batch-size', type=int, default=1024)
     p.add_argument('--sf-depth', type=int, default=10)
-    p.add_argument('--positions', type=int, default=5000)
+    p.add_argument('--positions', type=int, default=10000)
+    p.add_argument('--epochs', type=int, default=50, help='Max epochs per cycle')
     p.add_argument('--hours', type=float, default=24)
     p.add_argument('--pretrained', default=None)
+    p.add_argument('--max-dataset', type=int, default=200000)
     args = p.parse_args()
     
     trainer = FastTrainer(
@@ -229,6 +261,8 @@ if __name__ == '__main__':
         batch_size=args.batch_size,
         sf_depth=args.sf_depth,
         positions_per_cycle=args.positions,
+        epochs_per_cycle=args.epochs,
         pretrained=args.pretrained,
+        max_dataset=args.max_dataset,
     )
     trainer.run(hours=args.hours)
